@@ -1,118 +1,169 @@
-/* Toyota Sniffer
- * Two SPI slave ports used for capturing both HTM and MTH data from Toyota Gen3prius and similar aged Hybrids.
- * 
- * Output might be too dense for Uart? we will see. Maybe a third SPI slave will be needed to get data to ESP32 or ESP8266 for WIFI extraction
- */
-//I/O  Due  Due
-//     Port NET   Sniffer
-//PA8: 0    RX    RX from Atmega16U2. Dedicated UART does not clash with USART SPIs. Up to ~5MHz.
-//PA9: 1    TX    TX to Atmega16U2. As above
-//PA17 TWD0 SDA1  SCLK0 connect both SCLK to Toyota CLK
-//PA16 AD0  AD0   SCLK1
-//PA10 19   RXD2  MOSI0  Toyota HTM
-//PA12 17   RXD1  MOSI1  Toyota MTH
-//PB25 2    PWM2  CS0    Might have to frig the Chip Selects, connect them to a GPIO
-//PA14 23   PIN23 CS1
-//PB27 3    PWM3  GPIO to frig CSx
-//PC26 4    PWM4  REQ    Toyota REQ might need to tie to a GPIO interrupt.
+/*
+ToyotaSyncSerialSniffer
+Using ESP32-S2
+gets info from uart0 and uart1 and sends to a connected telnet client.
+IP address default is 192.168.4.1
+Telnet Port 23
 
+loop() too slow for the Toyota Sniffer. Using event handlers instead. Messages come in at 2ms intervals
+*/
 
-/******************* setup ***********************/
-void DataReceived(void);
-void ReqReceived(void);
+#include "driver/uart.h"
+#include <WiFi.h>
+
+// Set these to your desired credentials.
+const char *ssid = "ToyotaSniffer";
+const char *password = "password";
+
+WiFiServer server(23);     // set up on telnet
+WiFiClient client;
+
+#define HTM_PORT      UART_NUM_0
+#define MTH_PORT      UART_NUM_1
+#define HTM_RX_PIN    43
+#define MTH_RX_PIN    18
+#define BUF_SIZE      (256*8)
+static QueueHandle_t  htm_queue;
+static QueueHandle_t  mth_queue;
+struct port_t {
+  const QueueHandle_t* queueHandle;
+  int                  port;
+  const char*          str;
+};
+struct port_t htmPort { &htm_queue, HTM_PORT,"htm"};
+struct port_t mthPort { &mth_queue, MTH_PORT,"mth"};
+volatile bool clientConnected = false;
+void uart_event_task(void *);
 
 void setup() {
-  delay(1000);
-  Serial.begin(115200);
-  Serial.println();
-  Serial.print("Starting Sniffer ...");
-
-  Serial1.begin(9600);  // pre-initialize USART0
-  Serial2.begin(9600);  // pre-initialize USART1
-  USART0config();       // frig for spi slave
-  USART1config();       // frig for spi slave
-  
-  attachInterrupt(digitalPinToInterrupt(4), ReqReceived, FALLING); //zero write pointers
-// Interrupts: USART0 17, USART1 18
-  attachInterrupt(17, DataReceived, HIGH); //Byte Received
-
+  pinMode(LED_BUILTIN, OUTPUT);
+  uart_config_t ToyotaConfig = {
+        .baud_rate = 500000,
+        .data_bits = UART_DATA_8_BITS,
+        .parity    = UART_PARITY_DISABLE,
+        .stop_bits = UART_STOP_BITS_1,
+        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE
+  };
+  uart_param_config(HTM_PORT, &ToyotaConfig);
+  uart_param_config(MTH_PORT, &ToyotaConfig);
+  uart_set_pin(HTM_PORT, UART_PIN_NO_CHANGE, HTM_RX_PIN, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
+  uart_set_pin(MTH_PORT, UART_PIN_NO_CHANGE, MTH_RX_PIN, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
+  uart_driver_install(HTM_PORT, BUF_SIZE, 0, 20, &htm_queue, 0);
+  uart_driver_install(MTH_PORT, BUF_SIZE, 0, 20, &mth_queue, 0);
+  uart_set_rx_timeout(HTM_PORT, 5);    // aim is that timeout will break up the messages
+  uart_set_rx_timeout(MTH_PORT, 5);
+  uart_set_rx_full_threshold(HTM_PORT, 121); // set lower if HW FIFO overflows at high bit rates.
+  // You can remove the password parameter if you want the AP to be open.
+  WiFi.softAP(ssid, password);
+  server.begin();
+  xTaskCreate(uart_event_task, "uart_event_task", 2048, &htmPort, 12, NULL);
+  xTaskCreate(uart_event_task, "uart_event_task", 2048, &mthPort, 12, NULL);
 }
 
-uint8_t last_req = false;
-uint8_t htm_buffer[256];
-uint8_t mth_buffer[256];
-volatile uint8_t htm_write_p = 0;
-volatile uint8_t htm_read_p  = 0;
-volatile uint8_t mth_write_p = 0;
-volatile uint8_t mth_read_p  = 0;
-
-/******************* LOOP ***********************/
-void loop() {    
-
+void loop() {
+  ///////////////////////  static variables //////////////////////////////
+  static uint32_t clientMicros;
+  static uint32_t lastMicros = 0;
+  static int32_t ledState = LOW;
+  static uint32_t ledMicros = 0;
+  ///////////////////////  loop variables ////////////////////////////////
+  uint32_t loopMicros = micros();
+  ///////////////////////  flash LED /////////////////////////////////////
+  if(loopMicros > ledMicros){
+    ledState = ledState == HIGH ? LOW : HIGH;
+    digitalWrite(LED_BUILTIN,ledState);
+    ledMicros +=500000;
+  }
+  //////////////////////  unconnected state  /////////////////////////////
+  if(!client){
+    clientConnected = false;
+    client = server.available();              // check for incoming connection
+    if(client){
+      client.println("Send 'q (enter)' to quit ");
+      clientMicros = loopMicros;
+      clientConnected = true;
+    }
+  }
+  //////////////////////  connected state  ///////////////////////////////
+  if (client) {
+    bool quit = false;
+    while (client.available()) {             // if there's bytes to read from the client,
+      uint8_t inByte=client.read();
+      if(inByte=='q') {
+        client.stop();
+        quit = true;
+        break;
+      }
+    }
+  }
+  lastMicros = loopMicros;
 }
 
-void DataReceived() {
-  htm_buffer[htm_write_p++] = USART0->US_RHR;
-  mth_buffer[mth_write_p++] = USART1->US_RHR;
+void uart_event_task(void * Handle)
+{
+  struct port_t *portHandle = (struct port_t*) Handle;
+  uart_event_t event;
+  size_t buffered_size;
+  bool exit_condition = false;
+  uint8_t inData[128];
+  int data_length = 0;
+
+  //Infinite loop to run main bulk of task
+  while (1) {
+     
+    //Loop will continually block (i.e. wait) on event messages from the event queue
+    if(xQueueReceive(*portHandle->queueHandle, (void * )&event, (portTickType)portMAX_DELAY))
+    {
+      //Handle received event
+      switch (event.type) {
+      case UART_DATA:
+        uart_read_bytes(portHandle->port, inData, event.size, portMAX_DELAY);
+        if(client){
+          client.print(portHandle->str);
+          client.print(',');
+          client.print(event.size);
+          client.print(',');
+          client.print(millis());
+          client.print(',');
+          for(byte i=0; i<event.size;i++){
+            client.print(inData[i]);
+            client.print(',');
+          }
+          if(event.timeout_flag)
+            client.println("");
+          else
+            client.println("...");
+        }
+        break;
+      case UART_FRAME_ERR:
+        if(client){
+          client.print(portHandle->str);
+          client.println(",FRAME ERROR");
+        }
+        break;
+      default:
+        if(client){
+          client.print(portHandle->str);
+          client.print(',');
+          client.println(event.type);
+        }
+      }
+    }
+    //If you want to break out of the loop due to certain conditions, set exit condition to true
+    if (exit_condition) {
+      break;
+    }
+  }
+   
+  //Out side of loop now. Task needs to clean up and self terminate before returning
+  vTaskDelete(NULL);
 }
 
-void ReqReceived() {
-  htm_write_p = 0;
-  mth_write_p = 0;
-}
-/*-------------------------------------------------------------------------
-Instance   Peripheral  Signal  SPI Master  SPI Slave  I/O Line  Arduino Pin
----------------------------------------------------------------------------
-USART0     A, ID 17    RXD0    MISO        MOSI       PA10      RX1     19
-USART0     A, ID 17    TXD0    MOSI        MISO       PA11      TX1     18
-USART0     A, ID 17    RTS0    CS          x          PB25      D2       2
-USART0     A, ID 17    CTS0    x           CS         PB26      D22     22
-USART0     B, ID 17    SCK0    SCK         SCK        PA17      SDA1    70
----------------------------------------------------------------------------
-USART1     A, ID 18    RXD1    MISO        MOSI       PA12      RX2     17
-USART1     A, ID 18    TXD1    MOSI        MISO       PA13      TX2     16
-USART1     A, ID 18    RTS1    CS          x          PA14      D23     23
-USART1     A, ID 18    CTS1    x           CS         PA15      D24     24
-USART1     A, ID 18    SCK1    SCK         SCK        PA16      A0      54
----------------------------------------------------------------------------
-Register                            Page  Arduino          Settings 
-USART Mode Register                 839   USART1->US_MR    CLK0, 8_BIT, SPI_SLAVE, CPOL, CPHA
-USART Baud Rate Generator Register  855   USART1->US_BRGR  CD
-USART Transmit Holding Register     854   USART1->US_THR   Use to write data
-USART Receive Holding Register      853   USART1->US_RHR   Use to read data
-USART Channel Status Register       849   USART1->US_RHR   Use to control SPI tranfers
--------------------------------------------------------------------------*/
-void USART0config() {
-  USART0->US_WPMR = 0x55534100;   // Unlock the USART Mode register
-  USART0->US_MR |= 0x408CF;       // Set Mode to CLK0=1, 8_BIT, SPI_SLAVE
-  USART0->US_BRGR = 21;           // Clock Divider (SCK = 4MHz) <-- NOT USED
-  USART0->US_IMR =  (1<<0);       // ENABLE RXRDY INTERRUPT
-//  USART0->US_THR = 0;             // preload the output or maybe just suffer the underrun errors
-
-  PIOA->PIO_WPMR = 0x50494F00;    // Unlock PIOA Write Protect Mode Register
-  PIOB->PIO_WPMR = 0x50494F00;    // Unlock PIOB Write Protect Mode Register
-  PIOB->PIO_ABSR |= (0u << 26);   // CS: Assign A14 I/O to the Peripheral A function
-  PIOB->PIO_PDR |= (1u << 26);    // CS: Disable PIO control, enable peripheral control
-  PIOA->PIO_ABSR |= (1u << 17);   // SCK: Assign A16 I/O to the Peripheral B function
-  PIOA->PIO_PDR |= (1u << 17);    // SCK: Disable PIO control, enable peripheral control
-  PIOA->PIO_ABSR |= (0u << 10);   // MOSI: Assign PA13 I/O to the Peripheral A function
-  PIOA->PIO_PDR |= (1u << 10);    // MOSI: Disable PIO control, enable peripheral control
-  PIOA->PIO_ABSR |= (0u << 11);   // MISO: Assign A12 I/O to the Peripheral A function
-  PIOA->PIO_PDR |= (1u << 11);    // MISO: Disable PIO control, enable peripheral control
-}
-void USART1config() {
-  USART1->US_WPMR = 0x55534100;   // Unlock the USART Mode register
-  USART1->US_MR |= 0x408CF;       // Set Mode to CLK0=1, 8_BIT, SPI_Slave
-  USART1->US_BRGR = 21;           // Clock Divider (SCK = 4MHz) <-- NOT USED
-
-  PIOA->PIO_WPMR = 0x50494F00;    // Unlock PIOA Write Protect Mode Register
-  PIOB->PIO_WPMR = 0x50494F00;    // Unlock PIOB Write Protect Mode Register
-  PIOA->PIO_ABSR |= (0u << 15);   // CS: Assign A14 I/O to the Peripheral A function
-  PIOA->PIO_PDR |= (1u << 15);    // CS: Disable PIO control, enable peripheral control
-  PIOA->PIO_ABSR |= (0u << 16);   // SCK: Assign A16 I/O to the Peripheral A function
-  PIOA->PIO_PDR |= (1u << 16);    // SCK: Disable PIO control, enable peripheral control
-  PIOA->PIO_ABSR |= (0u << 13);   // MOSI: Assign PA13 I/O to the Peripheral A function
-  PIOA->PIO_PDR |= (1u << 13);    // MOSI: Disable PIO control, enable peripheral control
-  PIOA->PIO_ABSR |= (0u << 12);   // MISO: Assign A12 I/O to the Peripheral A function
-  PIOA->PIO_PDR |= (1u << 12);    // MISO: Disable PIO control, enable peripheral control
-}
+/*
+ * references:
+ * https://github.com/espressif/arduino-esp32/blob/master/tools/sdk/esp32s2/include/driver/include/driver/uart.h
+ * https://docs.espressif.com/projects/esp-idf/en/latest/esp32/api-reference/peripherals/uart.html
+ * https://github.com/espressif/esp-idf/blob/2f9d47c708f39772b0e8f92d147b9e85aa3a0b19/examples/peripherals/uart/uart_events/main/uart_events_example_main.c
+ * https://www.esp32.com/viewtopic.php?t=9939#
+ * 
+ */
