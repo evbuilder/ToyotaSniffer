@@ -22,4 +22,5 @@ Sniffer design
 ---
 Because of the async framing bits, we don't actually need the clk signal.
 The ESP32-S2 has a configurable receive timeout interrupt, which means we don't need the req signal either.
-Expected output rate is (120+100 Bytes) * 200Hz = 44kBps. For this commmit, I translated the data to .csv format, and had the two data streams run by independent tasks. Unfortunately they intermingle their output into a garbled mess, and the x4 protocol overhead is excessive and buffers are overrun in short order
+Expected output rate is (120+100 Bytes) * 200Hz = 44kBps.
+For this commmit, the data buffers are serviced by one task which sends out complete messages in binary with a minimal prefix. This seems to send out all data - with 314 kBytes sent in ~5 seconds.
