@@ -26,7 +26,6 @@ WiFiClient client;
 static QueueHandle_t  htm_queue;
 static QueueHandle_t  mth_queue;
 
-volatile bool clientConnected = false;
 void uart_event_task(void *);
 
 void setup() {
@@ -47,6 +46,7 @@ void setup() {
   uart_set_rx_timeout(HTM_PORT, 5);    // aim is that timeout will break up the messages
   uart_set_rx_timeout(MTH_PORT, 5);
   uart_set_rx_full_threshold(HTM_PORT, 121); // set lower if HW FIFO overflows at high bit rates.
+  uart_set_rx_full_threshold(MTH_PORT, 121);
   // You can remove the password parameter if you want the AP to be open.
   WiFi.softAP(ssid, password);
   server.begin();
@@ -69,12 +69,10 @@ void loop() {
   }
   //////////////////////  unconnected state  /////////////////////////////
   if(!client){
-    clientConnected = false;
     client = server.available();              // check for incoming connection
     if(client){
       client.println("Send 'q (enter)' to quit ");
       clientMicros = loopMicros;
-      clientConnected = true;
     }
   }
   //////////////////////  connected state  ///////////////////////////////
@@ -94,7 +92,8 @@ void loop() {
 
 void uart_event_task(void * Unused)
 {
-  uart_event_t event;
+  uart_event_t h_event;
+  uart_event_t m_event;
   size_t buffered_size;
   bool exit_condition = false;
   struct {
@@ -104,22 +103,24 @@ void uart_event_task(void * Unused)
     uint8_t msg[128];
     uint8_t more    = '+';
   }inData;
-
   int data_length = 0;
   uint8_t allowRTOStime = 0;
+  BaseType_t hq, mq;
 
   //Infinite loop to run main bulk of task
   while (1) {
-    if(xQueueReceive(htm_queue, (void * )&event, allowRTOStime++%64 ? 0:1 ))   //check htm queue
+    mq = xQueueReceive(mth_queue, (void * )&m_event, allowRTOStime++%64 ? 0:1 );
+    hq = xQueueReceive(htm_queue, (void * )&h_event, 0);
+    if(hq)   //check htm queue
     {
       //Handle received event
-      switch (event.type) {
+      switch (h_event.type) {
       case UART_DATA:
-        data_length = uart_read_bytes(HTM_PORT, inData.msg, event.size, 0);
+        data_length = uart_read_bytes(HTM_PORT, inData.msg, h_event.size, 0);
         if(client){
           inData.prefix = 'H';
           inData.length = data_length;
-          if(!event.timeout_flag)
+          if(!h_event.timeout_flag)
             inData.msg[data_length++]='+';
           client.write((uint8_t*)&inData, data_length + 3);
         }
@@ -143,20 +144,20 @@ void uart_event_task(void * Unused)
       default:
         if(client){
           client.print("\nhtm,");
-          client.println(event.type);
+          client.println(h_event.type);
         }
       }
     }
-    if(xQueueReceive(mth_queue, (void * )&event, 0))   //check mth queue, don't wait.
+    if(mq)   //check mth queue, don't wait.
     {
       //Handle received event
-      switch (event.type) {
+      switch (m_event.type) {
       case UART_DATA:
-        data_length = uart_read_bytes(MTH_PORT, inData.msg, event.size, 0);
+        data_length = uart_read_bytes(MTH_PORT, inData.msg, m_event.size, 0);
         if(client){
           inData.prefix = 'M';
           inData.length = data_length;
-          if(!event.timeout_flag)
+          if(!m_event.timeout_flag)
             inData.msg[data_length++]='+';
           client.write((uint8_t*)&inData, data_length + 3);
         }
@@ -180,7 +181,7 @@ void uart_event_task(void * Unused)
       default:
         if(client){
           client.print("mth,");
-          client.println(event.type);
+          client.println(m_event.type);
         }
       }
     }
